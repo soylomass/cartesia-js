@@ -74,11 +74,7 @@ export default class WebSocket extends Client {
     }
 
     // Send audio request.
-    this.socket?.send(
-      JSON.stringify({
-        ...inputs,
-      })
-    );
+    this.socket?.send(JSON.stringify({ ...inputs }));
 
     const emitter = new Emittery<{
       message: string;
@@ -89,66 +85,69 @@ export default class WebSocket extends Client {
       encoding: this.#encoding,
       container: this.#container,
     });
-    // Used to signal that the stream is complete, either because the
-    // WebSocket has closed, or because the stream has finished.
     const streamCompleteController = new AbortController();
-    // Set a timeout.
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
     if (timeout > 0) {
-      timeoutId = setTimeout(streamCompleteController.abort, timeout);
+      timeoutId = setTimeout(() => streamCompleteController.abort(), timeout);
     }
+
     const handleMessage = createMessageHandlerForContextId(
       inputs.context_id,
       async ({ chunk, message, data }) => {
-        emitter.emit("message", message);
-        if (data.type === "timestamps") {
-          emitter.emit("timestamps", data.word_timestamps);
-          return;
-        }
-        if (isSentinel(chunk)) {
-          await source.close();
+        try {
+          emitter.emit("message", message);
+          if (data.type === "timestamps") {
+            emitter.emit("timestamps", data.word_timestamps);
+            return;
+          }
+          if (isSentinel(chunk)) {
+            await source.close();
+            streamCompleteController.abort();
+            return;
+          }
+          if (timeoutId) {
+            clearTimeout(timeoutId);
+            timeoutId = setTimeout(
+              () => streamCompleteController.abort(),
+              timeout
+            );
+          }
+          if (!chunk) {
+            return;
+          }
+          await source.enqueue(base64ToArray([chunk], this.#encoding));
+        } catch (error) {
+          // Ensure abort is called on error
           streamCompleteController.abort();
-          return;
+          throw error; // Optionally re-throw the error
         }
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-          timeoutId = setTimeout(streamCompleteController.abort, timeout);
-        }
-        if (!chunk) {
-          return;
-        }
-        await source.enqueue(base64ToArray([chunk], this.#encoding));
       }
     );
-    this.socket?.addEventListener("message", handleMessage, {
-      signal: streamCompleteController.signal,
-    });
-    this.socket?.addEventListener(
-      "close",
-      () => {
-        streamCompleteController.abort();
-      },
-      {
-        once: true,
-        signal: streamCompleteController.signal,
-      }
-    );
-    this.socket?.addEventListener(
-      "error",
-      () => {
-        streamCompleteController.abort();
-      },
-      {
-        once: true,
-        signal: streamCompleteController.signal,
-      }
-    );
+
+    const onClose = () => {
+      streamCompleteController.abort();
+    };
+
+    const onError = () => {
+      streamCompleteController.abort();
+    };
+
+    // Add event listeners
+    this.socket?.addEventListener("message", handleMessage);
+    this.socket?.addEventListener("close", onClose);
+    this.socket?.addEventListener("error", onError);
+
+    // Abort signal listener for cleanup
     streamCompleteController.signal.addEventListener("abort", () => {
       source.close();
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
       emitter.clearListeners();
+      // Remove event listeners to prevent memory leaks
+      this.socket?.removeEventListener("message", handleMessage);
+      this.socket?.removeEventListener("close", onClose);
+      this.socket?.removeEventListener("error", onError);
     });
 
     return {
